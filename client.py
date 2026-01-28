@@ -5,7 +5,6 @@ Serves HTML5 UI and connects to MCP server for data operations
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
 import base64
 import json
 import asyncio
@@ -13,6 +12,9 @@ from openai import AzureOpenAI
 import os
 from dotenv import load_dotenv
 from typing import Optional, List, Dict, Any
+from contextlib import AsyncExitStack, asynccontextmanager
+from mcp import ClientSession
+from mcp.client.sse import sse_client
 import time
 
 # Load environment variables
@@ -38,63 +40,96 @@ app.add_middleware(
 )
 
 # MCP server configuration
-MCP_SERVER_URL = "http://127.0.0.1:8001"
+MCP_SSE_URL = "http://127.0.0.1:8001/sse"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create and keep a single MCP ClientSession open for the FastAPI app lifetime."""
+    exit_stack = AsyncExitStack()
+    try:
+        # Connect via SSE transport. URL should match your server's SSE endpoint.
+        read, write = await exit_stack.enter_async_context(sse_client(MCP_SSE_URL))
+        session = await exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        app.state.mcp_session = session
+        yield
+    finally:
+        await exit_stack.aclose()
+
+
+# Initialize FastAPI app (after defining lifespan)
+app = FastAPI(title="Data Insight MCP Client", lifespan=lifespan)
+
+def _normalize_tool_result(call_result):
+    """Convert MCP CallToolResult into plain Python (dict/str) for JSON responses."""
+    # call_result usually has: content (list), isError (bool)
+    is_error = getattr(call_result, 'isError', False)
+    content = getattr(call_result, 'content', call_result)
+
+    parts = []
+    if isinstance(content, list):
+        for item in content:
+            if hasattr(item, 'text'):
+                parts.append(item.text)
+            else:
+                # Fall back to pydantic dump / string
+                dumped = None
+                if hasattr(item, 'model_dump'):
+                    try:
+                        dumped = item.model_dump()
+                    except Exception:
+                        dumped = None
+                parts.append(dumped if dumped is not None else str(item))
+    else:
+        parts.append(content)
+
+    # If single text blob that looks like JSON, parse it.
+    if len(parts) == 1 and isinstance(parts[0], str):
+        txt = parts[0].strip()
+        if (txt.startswith('{') and txt.endswith('}')) or (txt.startswith('[') and txt.endswith(']')):
+            import json
+            try:
+                parsed = json.loads(txt)
+                if isinstance(parsed, dict):
+                    parsed.setdefault('status', 'error' if is_error else parsed.get('status', 'success'))
+                return parsed
+            except Exception:
+                pass
+        return {'status': 'error' if is_error else 'success', 'response': parts[0]}
+
+    return {'status': 'error' if is_error else 'success', 'content': parts}
 
 
 async def call_mcp_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call an MCP tool on the server
-
-    Args:
-        tool_name: Name of the MCP tool to call
-        arguments: Tool arguments as dictionary
-
-    Returns:
-        Tool execution result
-    """
+    """Call a tool on the connected MCP server using the MCP protocol (SSE transport)."""
+    session: ClientSession = app.state.mcp_session
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            # MCP protocol: POST to /call-tool endpoint with tool name and arguments
-            response = await client.post(
-                f"{MCP_SERVER_URL}/call-tool",
-                json={
-                    "name": tool_name,
-                    "arguments": arguments
-                }
-            )
-
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {
-                    "status": "error",
-                    "message": f"MCP server returned status {response.status_code}: {response.text}"
-                }
-    except httpx.ConnectError:
-        return {
-            "status": "error",
-            "message": "Could not connect to MCP server. Please ensure the MCP server is running on port 8001."
-        }
+        result = await session.call_tool(tool_name, arguments=arguments)
+        return _normalize_tool_result(result)
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error calling MCP tool: {str(e)}"
-        }
+        return {"status": "error", "message": f"Error calling MCP tool '{tool_name}': {e}"}
 
 
 async def get_mcp_tools() -> List[Dict[str, Any]]:
-    """
-    Discover available tools from MCP server
-
-    Returns:
-        List of tool definitions
-    """
+    """Discover available tools from MCP server."""
+    session: ClientSession = app.state.mcp_session
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(f"{MCP_SERVER_URL}/tools")
-            if response.status_code == 200:
-                return response.json()
-            return []
+        res = await session.list_tools()
+        tools = getattr(res, 'tools', res)
+        out = []
+        for t in tools:
+            # Tool objects typically have name/description/inputSchema
+            name = getattr(t, 'name', None)
+            desc = getattr(t, 'description', '')
+            schema = getattr(t, 'inputSchema', None)
+            if schema is None and hasattr(t, 'model_dump'):
+                try:
+                    schema = t.model_dump().get('inputSchema')
+                except Exception:
+                    schema = None
+            out.append({"name": name, "description": desc, "inputSchema": schema})
+        return out
     except Exception:
         return []
 
@@ -785,6 +820,7 @@ async def generate_insights(spec: str = Form("")):
             "tables": None,  # Analyze all tables
             "spec": spec
         })
+        print(f"Insights generation result: {result}")
 
         return JSONResponse(content=result)
 
@@ -797,17 +833,18 @@ async def generate_insights(spec: str = Form("")):
 
 @app.get("/health")
 async def health_check():
-    """
-    Health check endpoint
-    """
+    """Health check endpoint (checks MCP session readiness)."""
+    mcp_status = "disconnected"
     try:
-        # Try to connect to MCP server
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{MCP_SERVER_URL}/health")
-            mcp_status = "connected" if response.status_code == 200 else "disconnected"
+        session: ClientSession = app.state.mcp_session
+        # Prefer ping if available; fall back to listing tools.
+        if hasattr(session, 'send_ping'):
+            await session.send_ping()
+        else:
+            await session.list_tools()
+        mcp_status = "connected"
     except Exception:
         mcp_status = "disconnected"
-
     return {
         "status": "healthy",
         "mcp_server": mcp_status,

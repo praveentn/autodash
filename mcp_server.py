@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 from openai import AzureOpenAI
 import os
 from dotenv import load_dotenv
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 from scipy import stats
@@ -27,7 +27,16 @@ azure_client = AzureOpenAI(
 )
 
 # Initialize FastMCP server
-mcp = FastMCP("DataInsightServer")
+# mcp = FastMCP("DataInsightServer")
+
+mcp = FastMCP(
+    name="DataInsightServer",
+    port=8001,
+    host="127.0.0.1",
+    log_level="INFO",
+    # warn_on_duplicate_tools=True
+)
+print(mcp.settings.port)
 
 # Database configuration
 DB_PATH = "data.db"
@@ -284,7 +293,7 @@ Generate the SQL query:"""
 
 
 @mcp.tool()
-def generate_insights(tables: List[str] = None, spec: str = "") -> Dict[str, Any]:
+def generate_insights(tables: Optional[List[str]] = None, spec: str = "") -> Dict[str, Any]:
     """
     Tool 3: Generate statistical and ML-based insights from data
 
@@ -299,6 +308,7 @@ def generate_insights(tables: List[str] = None, spec: str = "") -> Dict[str, Any
         Dictionary with comprehensive insights
     """
     try:
+        print("Starting insights generation...")
         conn = get_db_connection()
 
         # Get tables to analyze
@@ -314,7 +324,11 @@ def generate_insights(tables: List[str] = None, spec: str = "") -> Dict[str, Any
 
         all_insights = []
 
+        # log the spec
+        print(f"Generating insights with spec: {spec}")
+
         for table in tables:
+            print(f"Analyzing table: {table}")
             try:
                 # Read table data
                 df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
@@ -322,6 +336,7 @@ def generate_insights(tables: List[str] = None, spec: str = "") -> Dict[str, Any
                 if df.empty:
                     continue
 
+                print(f"Table {table} has {len(df)} rows and {len(df.columns)} columns.")
                 table_insights = {
                     "table_name": table,
                     "row_count": len(df),
@@ -475,8 +490,13 @@ Focus on the most interesting patterns, anomalies, or actionable insights."""
         }
 
 
+
 if __name__ == "__main__":
-    print("Starting MCP Data Insight Server on http://127.0.0.1:8001")
-    print("Available tools: ingest_excel, query_data, generate_insights")
-    print("Available resources: db://schema")
-    mcp.run(transport="sse", host="127.0.0.1", port=8001)
+    # If your version ignores constructor host/port, force it:
+    mcp.settings.host = "127.0.0.1"
+    mcp.settings.port = 8001
+
+    # choose transport explicitly
+    mcp.run(transport="sse")              # SSE endpoint typically /sse
+    # OR
+    # mcp.run(transport="streamable-http")  # endpoint typically /mcp
